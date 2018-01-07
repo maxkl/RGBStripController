@@ -4,7 +4,7 @@ SOURCENAMES := main.c
 HEADERNAMES :=
 
 CC := msp430-elf-gcc
-CCFLAGS := -Wall -Wextra -O2 -mmcu=$(MCU)
+CCFLAGS := -Wall -Wextra -g -Os -mmcu=$(MCU) -I/opt/ti/mspgcc/msp430-elf/include -DNDEBUG
 
 SRCDIR := src
 OUTFILE := main.elf
