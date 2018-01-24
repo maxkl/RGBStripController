@@ -5,77 +5,30 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define ARRAY_SIZE(array) (sizeof(array) / sizeof(*(array)))
+#include <shared/commands.h>
+#include <shared/i2c.h>
 
 #ifndef NDEBUG
 #define LOGGING
+#include "uart.h"
 #endif
 
-#define PWM_OFF_THRESHOLD 2
+#include "rgb.h"
+#include "color.h"
+
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof(*(array)))
 
 #define BRIGHTNESS_MAX 63
 #define SPEED_MAX 63
 
-#define UART_TXD BIT2
-
-struct color {
-    uint16_t r;
-    uint16_t g;
-    uint16_t b;
-};
+#define MAX_SLAVE_COUNT 16
 
 enum mode {
     MODE_STATIC,
     MODE_ANIMATED
 };
 
-static const uint16_t PWM_LUT[] = {
-#include "PWM_LUT.txt"
-};
-
-static const struct color colors_static[] = {
-    // Shades of red   Shades of green    Shades of blue     White
-    { 1023, 0, 0 },    { 0, 1023, 0 },    { 0, 0, 1023 },    { 1023, 1023, 1023 },
-    { 1023, 256, 0 },  { 0, 1023, 256 },  { 256, 0, 1023 },
-    { 1023, 512, 0 },  { 0, 1023, 512 },  { 512, 0, 1023 },
-    { 1023, 768, 0 },  { 0, 1023, 768 },  { 768, 0, 1023 },
-    { 1023, 1023, 0 }, { 0, 1023, 1023 }, { 1023, 0, 1023 }
-};
-
-static const struct color colors_flash[] = {
-    { 1023, 0, 0 },
-    { 0, 1023, 0 },
-    { 0, 0, 1023 }
-};
-
-static const struct color colors_strobe[] = {
-    { 1023, 0, 0 },
-    { 0, 1023, 0 },
-    { 0, 0, 1023 },
-    { 1023, 1023, 0 },
-    { 0, 1023, 1023 },
-    { 1023, 0, 1023 },
-    { 1023, 1023, 1023 }
-};
-
-static const struct color colors_fade[] = {
-    { 1023, 0, 0 },
-    { 0, 0, 0 },
-    { 0, 1023, 0 },
-    { 0, 0, 0 },
-    { 0, 0, 1023 },
-    { 0, 0, 0 }
-};
-
-static const struct color colors_smooth[] = {
-    { 0, 1023, 0 },
-    { 1023, 0, 0 },
-    { 0, 0, 1023 },
-    { 0, 1023, 0 },
-    { 1023, 1023, 1023 }
-};
-
-static uint16_t buffered_TA1CCR0 = 0, buffered_TA1CCR1 = 0, buffered_TA1CCR2 = 0;
+#include "colors.h"
 
 static bool is_on = true;
 
@@ -88,27 +41,21 @@ static const struct color *animation_colors = NULL;
 static uint8_t animation_color_count = 0;
 static bool animation_smooth = false;
 
+static uint16_t animation_t = 0;
+static uint8_t animation_color_index = 0, animation_next_color_index = 1;
+
 static volatile uint16_t unhandled_animation_steps = 0;
 
-#ifdef LOGGING
-static void uart_send(uint8_t data);
-static void uart_puts(char *s);
-static void uart_puthex(uint16_t n);
-#endif
+static uint8_t slave_addresses[MAX_SLAVE_COUNT];
+static uint8_t slave_count = 0;
 
+static void discover_devices();
+static void update_static_color();
 static void animate();
+static void handle_command(uint8_t command);
 
-static void handle_command(uint8_t addr, uint8_t cmd, bool repeated);
-
-static uint16_t interp(uint16_t a, uint16_t b, uint16_t t) {
+static uint16_t interp_1024(uint16_t a, uint16_t b, uint16_t t) {
     return (uint32_t) ((uint32_t) a * (uint32_t) (1023 - t) + (uint32_t) b * t) / (uint32_t) 1023;
-}
-
-static void rgb_set(uint16_t r, uint16_t g, uint16_t b) {
-    // Correct for non-linear brightness of the LED
-    buffered_TA1CCR0 = PWM_LUT[r];
-    buffered_TA1CCR1 = PWM_LUT[g];
-    buffered_TA1CCR2 = PWM_LUT[b];
 }
 
 static void rgb_set_with_brightness(uint16_t r, uint16_t g, uint16_t b, uint8_t brightness) {
@@ -117,6 +64,142 @@ static void rgb_set_with_brightness(uint16_t r, uint16_t g, uint16_t b, uint8_t 
         (g * brightness) / BRIGHTNESS_MAX,
         (b * brightness) / BRIGHTNESS_MAX
     );
+}
+
+int main() {
+    // Disable the watchdog timer
+    WDTCTL = WDTPW | WDTHOLD;
+
+    // Configure the microcontroller to run at 16 MHz
+    BCSCTL1 = CALBC1_16MHZ;
+    DCOCTL = CALDCO_16MHZ;
+
+    // Configure all pins as outputs
+    P1DIR = 0xff;
+    P2DIR = 0xff;
+    // Configure P2.6 and P2.7 as normal GPIOs (they are configured as XIN and XOUT on reset)
+    P2SEL = 0x00;
+
+#ifdef LOGGING
+    uart_init();
+#endif
+
+    rgb_init();
+
+    i2c_init_master();
+
+    // Enable timer interrupt for counting animation steps
+    TA0CTL |= TAIE;
+
+    __enable_interrupt();
+
+    // Give the slaves time to start up (~10 ms)
+    __delay_cycles(160000);
+
+    discover_devices();
+
+    // Initialize PWM duty cycles before enabling the outputs
+    update_static_color();
+
+    rgb_enable();
+
+    while (1) {
+        // Poll I2C slaves for commands
+        for (uint8_t i = 0; i < slave_count; i++) {
+            // Wait until STOP condition of previous transaction is generated
+            // TODO: use "repeated start" feature to speed up polling?
+            while (UCB0CTL1 & UCTXSTP);
+
+            UCB0I2CSA = slave_addresses[i];
+
+            // Configure for receiver mode
+            UCB0CTL1 &= ~UCTR;
+            // Generate START condition
+            UCB0CTL1 |= UCTXSTT;
+
+            // Wait until slave acknowledges address
+            while (UCB0CTL1 & UCTXSTT);
+
+            // Slave didn't acknowledge address
+            if (UCB0STAT & UCNACKIFG) {
+                // Generate STOP condition
+                UCB0CTL1 |= UCTXSTP;
+                continue;
+            }
+
+            // Generate STOP condition
+            UCB0CTL1 |= UCTXSTP;
+
+            // Wait until data byte received
+            while (!(IFG2 & UCB0RXIFG));
+
+            uint8_t command = UCB0RXBUF;
+
+            // The slave may not have a command for us
+            if (command != SLAVE_COMMAND_NONE) {
+                handle_command(command);
+            }
+        }
+
+        if (is_on) {
+            // Atomically read and clear the number of animation steps we will handle
+            __disable_interrupt();
+            uint16_t animation_steps = unhandled_animation_steps;
+            unhandled_animation_steps = 0;
+            __enable_interrupt();
+
+            for (uint16_t i = 0; i < animation_steps; i++) {
+                animate();
+            }
+        }
+    }
+}
+
+static void broadcast_master_command(uint8_t command) {
+    while (UCB0CTL1 & UCTXSTP);
+
+    UCB0I2CSA = 0x00;
+
+    UCB0CTL1 |= UCTR | UCTXSTT;
+
+    while (!(IFG2 & UCB0TXIFG));
+
+    UCB0TXBUF = command;
+
+    while (!(IFG2 & UCB0TXIFG));
+
+    UCB0CTL1 |= UCTXSTP;
+}
+
+static void discover_devices() {
+    for (uint8_t address = 0x08; address <= 0x77 && slave_count < MAX_SLAVE_COUNT; address++) {
+        // Wait until STOP condition of previous transaction is generated
+        while (UCB0CTL1 & UCTXSTP);
+
+        UCB0I2CSA = address;
+
+        // Configure for receiver mode
+        UCB0CTL1 &= ~UCTR;
+        // Generate START condition
+        UCB0CTL1 |= UCTXSTT;
+
+        // Wait until slave acknowledges address
+        while (UCB0CTL1 & UCTXSTT);
+
+        // There is no slave with that address
+        if (UCB0STAT & UCNACKIFG) {
+            // Generate STOP condition
+            UCB0CTL1 |= UCTXSTP;
+            continue;
+        }
+
+        // Generate STOP condition
+        UCB0CTL1 |= UCTXSTP;
+
+        // Add the slave to our list
+        slave_addresses[slave_count] = address;
+        slave_count++;
+    }
 }
 
 static void update_static_color() {
@@ -128,153 +211,39 @@ static void update_static_color() {
     );
 }
 
-int main() {
-    // Disable the watchdog timer
-    WDTCTL = WDTPW | WDTHOLD;
-
-    // Configure the microcontroller to run at 8 MHz
-    BCSCTL1 = CALBC1_8MHZ;
-    DCOCTL = CALDCO_8MHZ;
-
-    // Reset all outputs to a known, power-saving state
-    P1DIR = 0xff;
-    P1OUT = 0x00;
-    P1SEL = 0x00;
-    P1SEL2 = 0x00;
-    P2DIR = 0xff;
-    P2OUT = 0x00;
-    P2SEL = 0x00;
-    P2SEL2 = 0x00;
-
-    // RGB LEDs off initially
-    P2DIR |= BIT0 | BIT1 | BIT4;
-    P2SEL &= ~(BIT0 | BIT1 | BIT4);
-
-#ifdef LOGGING
-    // UART initialisation
-
-    // Initialize UART pins
-    P1SEL |= UART_TXD;
-    P1SEL2 |= UART_TXD;
-
-    // Put USCI into reset state
-    UCA0CTL1 = UCSWRST;
-    // 8 bits data, no parity, 1 stop bit
-    UCA0CTL0 = UCMODE_0;
-    UCA0CTL1 |= UCSSEL_2;
-    // Baud rate: 9600 bps @ 8 MHz (http://mspgcc.sourceforge.net/baudrate.html)
-    UCA0BR0 = 0x41;
-    UCA0BR1 = 0x03;
-    UCA0MCTL = UCBRS_2;
-    // Release USCI reset
-    UCA0CTL1 &= ~UCSWRST;
-#endif
-
-    // TODO: use both timers for hardware PWM
-
-    // Initialize Timer_A0
-    // SMCLK divided by 8 (1 MHz), 'Continous up' mode, generate interrupts on rollover
-    //TA0CTL = TASSEL_2 | ID_3 | MC_2 | TAIE;
-    // TACLK = 1 MHz; t = 1 / TACLK = 1 us; 16-bit-timer => interrupt every 65.536 ms
-    //TA0CCTL0 = CAP | CM_3 | SCS | CCIE;
-
-    // Initialize Timer_A1 for PWM generation
-    // SMCLK (8 MHz), 'Continous up' mode, generate interrupts on rollover
-    TA1CTL = TASSEL_2 | MC_2 | TAIE;
-    // Reset outputs when hitting comparator value, we'll set them on rollover in the ISR using 'output only' mode
-    TA1CCTL0 = OUTMOD_5 | OUT;
-    TA1CCTL1 = OUTMOD_5 | OUT;
-    TA1CCTL2 = OUTMOD_5 | OUT;
-    // Initialize comparator values to zero
-    TA1CCR0 = 0;
-    TA1CCR1 = 0;
-    TA1CCR2 = 0;
-
-    update_static_color();
-
-    __enable_interrupt();
-
-#ifdef LOGGING
-    uart_puts("Hello!\r\n");
-#endif
-
-    while (1) {
-        // TODO: poll I²C
-
-        if (is_on) {
-            uint16_t animation_steps = unhandled_animation_steps;
-            for (uint16_t i = 0; i < animation_steps; i++) {
-                animate();
-            }
-            __disable_interrupt();
-            unhandled_animation_steps -= animation_steps;
-            __enable_interrupt();
-        }
-    }
-}
-
-#ifdef LOGGING
-static void uart_send(uint8_t data) {
-    while (!(IFG2 & UCA0TXIFG));
-    UCA0TXBUF = data;
-}
-
-static void uart_puts(char *s) {
-    while (*s != '\0') {
-        uart_send(*s);
-        s++;
-    }
-}
-
-static void uart_puthex(uint16_t n) {
-    static const char hex[] = {
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        'A', 'B', 'C', 'D', 'E', 'F'
-    };
-
-    uart_send(hex[n >> 12]);
-    uart_send(hex[(n >> 8) & 0xf]);
-    uart_send(hex[(n >> 4) & 0xf]);
-    uart_send(hex[n & 0xf]);
-}
-#endif
-
 static void animate() {
-    static uint16_t t = 0;
-    static uint8_t i = 0, i_next = 1;
-
     switch (selected_mode) {
         case MODE_ANIMATED:
             if (animation_smooth) {
-                t += selected_speed + 1;
-                if (t > 1023 * 4) {
-                    t = 0;
+                animation_t += selected_speed + 1;
+                if (animation_t > 1023 * 4) {
+                    animation_t = 0;
 
-                    i = i_next;
-                    i_next = (i + 1) % animation_color_count;
+                    animation_color_index = animation_next_color_index;
+                    animation_next_color_index = (animation_color_index + 1) % animation_color_count;
                 }
 
-                uint16_t t_1024 = t / 4;
+                uint16_t t_1024 = animation_t / 4;
 
                 rgb_set_with_brightness(
-                    interp(animation_colors[i].r, animation_colors[i_next].r, t_1024),
-                    interp(animation_colors[i].g, animation_colors[i_next].g, t_1024),
-                    interp(animation_colors[i].b, animation_colors[i_next].b, t_1024),
+                    interp_1024(animation_colors[animation_color_index].r, animation_colors[animation_next_color_index].r, t_1024),
+                    interp_1024(animation_colors[animation_color_index].g, animation_colors[animation_next_color_index].g, t_1024),
+                    interp_1024(animation_colors[animation_color_index].b, animation_colors[animation_next_color_index].b, t_1024),
                     selected_brightness
                 );
             } else {
-                t += selected_speed * 4 + 1;
-                if (t > 1023 * 4) {
-                    t = 0;
+                animation_t += selected_speed * 4 + 1;
+                if (animation_t > 1023 * 4) {
+                    animation_t = 0;
 
-                    i = i_next;
-                    i_next = (i + 1) % animation_color_count;
+                    animation_color_index = animation_next_color_index;
+                    animation_next_color_index = (animation_color_index + 1) % animation_color_count;
                 }
 
                 rgb_set_with_brightness(
-                    animation_colors[i].r,
-                    animation_colors[i].g,
-                    animation_colors[i].b,
+                    animation_colors[animation_color_index].r,
+                    animation_colors[animation_color_index].g,
+                    animation_colors[animation_color_index].b,
                     selected_brightness
                 );
             }
@@ -289,6 +258,8 @@ static void select_color(uint8_t index) {
     selected_color = index;
 
     update_static_color();
+
+    broadcast_master_command(MASTER_COMMAND_ANIMATION_OFF);
 }
 
 static void select_animation(const struct color *colors, uint8_t color_count, bool smooth) {
@@ -296,6 +267,24 @@ static void select_animation(const struct color *colors, uint8_t color_count, bo
     animation_colors = colors;
     animation_color_count = color_count;
     animation_smooth = smooth;
+
+    animation_t = 0;
+    animation_color_index = 0;
+    animation_next_color_index = 1;
+
+    broadcast_master_command(MASTER_COMMAND_ANIMATION_ON);
+}
+
+static void set_brightness(uint8_t brightness) {
+    selected_brightness = brightness;
+
+    if (selected_mode == MODE_STATIC) {
+        update_static_color();
+    }
+}
+
+static void set_speed(uint8_t speed) {
+    selected_speed = speed;
 }
 
 static void increment_brightness() {
@@ -339,7 +328,7 @@ static void turn_on() {
 
     is_on = true;
 
-    TA1CTL |= TAIE;
+    rgb_enable();
 
     __enable_interrupt();
 }
@@ -353,101 +342,57 @@ static void turn_off() {
 
     is_on = false;
 
-    TA1CTL &= ~TAIE;
-
-    P2SEL &= ~BIT0;
-    P2SEL &= ~BIT1;
-    P2SEL &= ~BIT2;
+    rgb_disable();
 
     __enable_interrupt();
 }
 
-static void handle_command(uint8_t address, uint8_t command, bool repeated) {
+static void handle_command(uint8_t command) {
 #ifdef LOGGING
     uart_puts("cmd: ");
-    uart_puthex(address);
-    uart_puts(", ");
     uart_puthex(command);
-    if (repeated) {
-        uart_puts(" (R)");
-    }
     uart_puts("\r\n");
 #endif
 
-    // TODO: properly decode command
+    // TODO: broadcast state changes to all slaves:
+    //   "mode changed to ANIMATED", "requested visualizer", ...
 
     switch (command) {
-        case 0: if (selected_mode == MODE_ANIMATED) { increment_speed(); } else { increment_brightness(); } break;
-        case 1: if (selected_mode == MODE_ANIMATED) { decrement_speed(); } else { decrement_brightness(); } break;
-        case 2: turn_off(); break;
-        case 3: turn_on(); break;
-        case 4: select_color(0); break;
-        case 5: select_color(1); break;
-        case 6: select_color(2); break;
-        case 7: select_color(3); break;
-        case 8: select_color(4); break;
-        case 9: select_color(5); break;
-        case 10: select_color(6); break;
-        case 11: select_animation(colors_flash, ARRAY_SIZE(colors_flash), false); break;
-        case 12: select_color(7); break;
-        case 13: select_color(8); break;
-        case 14: select_color(9); break;
-        case 15: select_animation(colors_strobe, ARRAY_SIZE(colors_strobe), false); break;
-        case 16: select_color(10); break;
-        case 17: select_color(11); break;
-        case 18: select_color(12); break;
-        case 19: select_animation(colors_fade, ARRAY_SIZE(colors_fade), true); break;
-        case 20: select_color(13); break;
-        case 21: select_color(14); break;
-        case 22: select_color(15); break;
-        case 23: select_animation(colors_smooth, ARRAY_SIZE(colors_smooth), true); break;
+        case SLAVE_COMMAND_OFF: turn_off(); break;
+        case SLAVE_COMMAND_ON: turn_on(); break;
+        case SLAVE_COMMAND_BRIGHTNESS_DECREMENT: decrement_brightness(); break;
+        case SLAVE_COMMAND_BRIGHTNESS_INCREMENT: increment_brightness(); break;
+        case SLAVE_COMMAND_SPEED_DECREMENT: decrement_speed(); break;
+        case SLAVE_COMMAND_SPEED_INCREMENT: increment_speed(); break;
+        default:
+            if ((command & 0xf0) == 0x10) {
+                switch (command & 0x0f) {
+                    case 0: select_animation(colors_flash, ARRAY_SIZE(colors_flash), false); break;
+                    case 1: select_animation(colors_strobe, ARRAY_SIZE(colors_strobe), false); break;
+                    case 2: select_animation(colors_fade, ARRAY_SIZE(colors_fade), true); break;
+                    case 3: select_animation(colors_smooth, ARRAY_SIZE(colors_smooth), true); break;
+                }
+            } else if ((command & 0xe0) == 0x20) {
+                select_color(command & 0x1f);
+            } else if ((command & 0xc0) == 0x80) {
+                set_brightness(command & 0x3f);
+            } else if ((command & 0xc0) == 0xc0) {
+                set_speed(command & 0x3f);
+            }
     }
 }
 
-__attribute__((interrupt(TIMER1_A1_VECTOR)))
-void TIMER1_A1_ISR() {
-    // Stop the timer so we can safely mess with its registers.
-    // We also clear TAIFG and the timer counter
-    TA1CTL = TASSEL_2 | MC_0 | TAIE | TACLR;
+__attribute__((interrupt(TIMER0_A1_VECTOR)))
+void TIMER0_A1_ISR() {
+    // Clear TAIFG
+    TA0CTL &= ~TAIFG;
 
-    // Switch to output mode 0 to reset the output state to 1
-    TA1CCTL0 = OUTMOD_0 | OUT;
-    TA1CCTL1 = OUTMOD_0 | OUT;
-    TA1CCTL2 = OUTMOD_0 | OUT;
-    // Reset the output mode
-    TA1CCTL0 = OUTMOD_5 | OUT;
-    TA1CCTL1 = OUTMOD_5 | OUT;
-    TA1CCTL2 = OUTMOD_5 | OUT;
+    static uint8_t animation_steps_prescaler = 0;
 
-    // Apply the buffered duty cycles
-    TA1CCR0 = buffered_TA1CCR0;
-    TA1CCR1 = buffered_TA1CCR1;
-    TA1CCR2 = buffered_TA1CCR2;
+    animation_steps_prescaler++;
+    if (animation_steps_prescaler == 128) {
+        animation_steps_prescaler = 0;
 
-    // Let the timer run again
-    TA1CTL = TASSEL_2 | MC_2 | TAIE;
-
-    // Turn the output off if the duty cycle is below a certain threshold value
-    if (buffered_TA1CCR0 < PWM_OFF_THRESHOLD) {
-        P2SEL &= ~BIT0;
-    } else {
-        P2SEL |= BIT0;
+        unhandled_animation_steps++;
     }
-
-    // Turn the output off if the duty cycle is below a certain threshold value
-    if (buffered_TA1CCR1 < PWM_OFF_THRESHOLD) {
-        P2SEL &= ~BIT1;
-    } else {
-        P2SEL |= BIT1;
-    }
-
-    // Turn the output off if the duty cycle is below a certain threshold value
-    if (buffered_TA1CCR2 < PWM_OFF_THRESHOLD) {
-        P2SEL &= ~BIT4;
-    } else {
-        P2SEL |= BIT4;
-    }
-
-    // Increment animation steps
-    unhandled_animation_steps++;
 }

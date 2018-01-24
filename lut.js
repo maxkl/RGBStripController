@@ -3,15 +3,15 @@
  */
 
 const confs = {
-    'pwm': {
+    'pwm_1024': {
+        xMin: 0,
+        xMax: 1023,
+        f: x => 0.000977517 * Math.pow(x, 2)
+    },
+    'pwm_65536': {
         xMin: 0,
         xMax: 1023,
         f: x => 0.0626213 * Math.pow(x, 2)
-    },
-    'pwm_linear': {
-        xMin: 0,
-        xMax: 1023,
-        f: x => (65535 / 1023) * x
     },
     'sin': {
         xMin: 0,
@@ -20,7 +20,7 @@ const confs = {
     }
 };
 
-const confName = (process.argv.length >= 3) ? process.argv[2].toLowerCase() : 'pwm';
+const confName = (process.argv.length >= 3) ? process.argv[2].toLowerCase() : 'pwm_1024';
 const conf = confs[confName];
 
 for (let x = conf.xMin; x <= conf.xMax; x++) {
